@@ -1,6 +1,6 @@
 # Async FastAPI Worker Pool Example
 
-A minimal example showing how to build a small async job system using:
+A minimal example showing a small async job system using:
 
 - FastAPI for job submission
 - asyncio for scheduling
@@ -8,9 +8,10 @@ A minimal example showing how to build a small async job system using:
 - UNIX domain sockets for IPC
 - JSON command protocol
 - live worker stdout/stderr streaming
-- heartbeat health checks
+- event-driven SSE streams for job lifecycle
+- periodic heartbeat health checks
 
-This project is intentionally simple and educational, but demonstrates patterns used in real task runners.
+This project demonstrates patterns used in distributed job runners and workflow engines.
 
 ---
 
@@ -20,9 +21,15 @@ This project is intentionally simple and educational, but demonstrates patterns 
 - Worker pool managed by the main process
 - Automatic assignment to non-busy workers
 - Async IPC via `/tmp/<worker>.sock`
-- Structured logging with DEBUG output
-- Periodic scheduler tasks (heartbeat included)
-- Extensible command protocol (`ping`, `job`, etc.)
+- Structured logging (DEBUG level)
+- Scheduler emits events for job lifecycle:
+  - `"submitted"` → when job is queued
+  - `"result"` → when job completes
+  - Extendable for `"started"`, `"error"`, `"heartbeat"`, etc.
+- SSE streams:
+  - `/events` → global stream of all events
+  - `/events/{worker}` → per-worker event stream
+- Periodic heartbeat tasks for liveness checking
 
 ---
 
@@ -63,6 +70,29 @@ You should see:
 - job execution logs
 - worker stdout streamed in real time
 
+## SSE Event Streams
+### Global stream
+```bash
+curl localhost:8000/events
+```
+
+Example output:
+
+```
+data: {"type":"submitted","payload":{"task":"hello"}}
+
+data: {"type":"result","worker":"bob","result":{"cmd":"result","worker":"bob","status":"done","input":{"task":"hello"}}}
+```
+
+### Per-worker stream
+
+```bash
+curl localhost:8000/events/alice
+```
+
+Only events related to that worker are streamed.
+
+---
 
 ## How It Works
 
@@ -70,18 +100,26 @@ You should see:
 2. Each worker opens a UNIX socket in /tmp
 3. Scheduler assigns jobs from a queue
 4. Jobs are sent via JSON over the socket
-5. Worker responds with JSON results
-6. Heartbeat periodically verifies worker health
+5. Scheduler emits events:
+  - when a job is submitted
+  - when a job is completed
+  - optionally when a job starts or fails
+6. SSE endpoints stream events globally or per worker
+7. Heartbeat periodically verifies worker health
+
+---
 
 ## Extending This
 
-Common next steps for production use:
-- worker restart on crash
-- job persistence (Redis/Postgres/etc.)
-- job timeouts and cancellation
-- priority queues
-- metrics & tracing
-- container orchestration support
+You can easily add:
+- job "started" events before sending to worker
+- error events for retries or failed jobs
+- job IDs / correlation IDs for tracing
+- persistent queues (Redis, PostgreSQL)
+- worker auto-restart on crash
+- priority queues and throttling
+- metrics collection / monitoring
+- WebSocket interface instead of SSE if needed
 
 ## License
 
