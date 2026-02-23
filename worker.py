@@ -36,7 +36,7 @@ async def worker_main(name: str):
             payload = msg["payload"]
             log.debug(f"processing job {payload}")
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(5)
 
             writer.write(
                 json.dumps(
