@@ -4,7 +4,8 @@ import os
 import sys
 import logging
 from pathlib import Path
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
@@ -48,9 +49,9 @@ class Worker:
         asyncio.create_task(self._stream(self.proc.stderr, "ERR"))
 
         while not self.sock_path.exists():
-            await asyncio.sleep(0.001)
+            await asyncio.sleep(0.05)
 
-        self.log.debug("worker socket ready")
+        self.log.debug("socket ready")
 
     async def _stream(self, stream, label):
         while True:
@@ -63,26 +64,21 @@ class Worker:
         reader, writer = await asyncio.open_unix_connection(str(self.sock_path))
         writer.write(json.dumps(payload).encode() + b"\n")
         await writer.drain()
-
         line = await reader.readline()
         writer.close()
         await writer.wait_closed()
-
         return json.loads(line)
 
     async def send_job(self, payload: dict):
         self.busy = True
-        self.log.debug(f"assigning job {payload}")
         try:
-            result = await self._send_cmd({"cmd": "job", "payload": payload})
-            return result
+            return await self._send_cmd({"cmd": "job", "payload": payload})
         finally:
             self.busy = False
 
     async def ping(self):
         try:
-            resp = await self._send_cmd({"cmd": "ping"})
-            return resp
+            return await self._send_cmd({"cmd": "ping"})
         except Exception as e:
             self.log.error(f"ping failed: {e}")
             return None
@@ -96,6 +92,11 @@ class Scheduler:
         self.queue: asyncio.Queue = asyncio.Queue()
         self.log = logging.getLogger("scheduler")
 
+        self.global_events: asyncio.Queue = asyncio.Queue()
+        self.worker_events: dict[str, asyncio.Queue] = {
+            w.name: asyncio.Queue() for w in workers
+        }
+
     async def start(self):
         asyncio.create_task(self._run())
 
@@ -103,10 +104,18 @@ class Scheduler:
         await self.queue.put(job)
         self.log.debug(f"job queued {job}")
 
+        # 🔴 emit immediately on submission
+        await self.emit({
+            "type": "submitted",
+            "payload": job,
+        })
+
     async def _run(self):
         while True:
             job = await self.queue.get()
             worker = await self._wait_for_free_worker()
+            worker.busy = True
+
             asyncio.create_task(self._handle_job(worker, job))
 
     async def _wait_for_free_worker(self) -> Worker:
@@ -114,13 +123,25 @@ class Scheduler:
             free = next((w for w in self.workers if not w.busy), None)
             if free:
                 return free
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.01)
 
     async def _handle_job(self, worker: Worker, job: dict):
-        result = await worker.send_job(job)
-        self.log.debug(f"job result {result}")
+        try:
+            result = await worker.send_job(job)
 
-    # -------- periodic --------
+            await self.emit({
+                "type": "result",
+                "worker": worker.name,
+                "result": result,
+            }, worker=worker.name)
+
+            self.log.debug(f"result {result}")
+
+        except Exception:
+            self.log.exception("job failed")
+
+        finally:
+            worker.busy = False
 
     def add_periodic(self, coro, interval: float):
         async def loop():
@@ -129,10 +150,16 @@ class Scheduler:
                 try:
                     await coro()
                 except Exception:
-                    self.log.exception("periodic task failed")
-
+                    self.log.exception("periodic failed")
         asyncio.create_task(loop())
 
+    async def emit(self, event: dict, worker: str | None = None):
+        # push to global stream
+        await self.global_events.put(event)
+
+        # push to worker stream if applicable
+        if worker and worker in self.worker_events:
+            await self.worker_events[worker].put(event)
 
 # ---------------- API ----------------
 
@@ -150,6 +177,32 @@ async def submit(job: Job):
     return {"queued": True}
 
 
+# ---------------- SSE helpers ----------------
+
+async def sse_stream(queue: asyncio.Queue):
+    while True:
+        event = await queue.get()
+        yield f"data: {json.dumps(event)}\n\n"
+
+
+@app.get("/events")
+async def global_events():
+    return StreamingResponse(
+        sse_stream(scheduler.global_events),
+        media_type="text/event-stream",
+    )
+
+
+@app.get("/events/{worker}")
+async def worker_events(worker: str):
+    if worker not in scheduler.worker_events:
+        raise HTTPException(404, "unknown worker")
+    return StreamingResponse(
+        sse_stream(scheduler.worker_events[worker]),
+        media_type="text/event-stream",
+    )
+
+
 # ---------------- Startup ----------------
 
 @app.on_event("startup")
@@ -165,9 +218,8 @@ async def startup():
     scheduler = Scheduler(workers)
     await scheduler.start()
 
-    # -------- heartbeat --------
+    # heartbeat
     async def heartbeat():
-        log.debug("heartbeat start")
         for w in workers:
             resp = await w.ping()
             log.debug(f"heartbeat {w.name}: {resp}")
